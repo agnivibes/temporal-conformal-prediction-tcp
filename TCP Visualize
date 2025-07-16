@@ -1,0 +1,247 @@
+# Script to visualize and compare prediction intervals during a volatile period.
+# ALL MODELS NOW MATCH ORIGINAL IMPLEMENTATION FROM CODE 2
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import warnings
+from tqdm import tqdm
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+
+# Model selection (LightGBM or sklearn)
+try:
+    import lightgbm as lgb
+
+    USE_LGB = True
+except ImportError:
+    from sklearn.ensemble import GradientBoostingRegressor
+
+    USE_LGB = False
+
+
+# --- MODEL CLASSES ---
+
+class TemporalConformalPredictor:
+    """Implements the Temporal Conformal Prediction (TCP) framework (Code 2 version)."""
+
+    def __init__(self, window_size=252, alpha=0.05, gamma_0=0.01, lambda_param=0.1, beta=0.7):
+        self.window_size, self.alpha = window_size, alpha
+        self.gamma_0, self.lambda_param, self.beta = gamma_0, lambda_param, beta
+        self.con_thr_low, self.con_thr_up = 0.0, 0.0
+        self.cover_errs = []
+        self.intervals = []
+        self.coverages = []
+        self.y_true_dates = None
+        self._init_models()
+
+    def _init_models(self):
+        if USE_LGB:
+            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha / 2, verbose=-1)
+            self.up_model = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha / 2, verbose=-1)
+        else:
+            from sklearn.ensemble import GradientBoostingRegressor
+            self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha / 2)
+            self.up_model = GradientBoostingRegressor(loss='quantile', alpha=1 - self.alpha / 2)
+
+    def _lr(self, t):
+        return self.gamma_0 / (1 + self.lambda_param * t) ** self.beta
+
+    def _create_features(self, returns_df):
+        df = returns_df.copy()
+        for lag in range(1, 6):
+            df[f'lag_{lag}'] = df['return'].shift(lag)
+        df['vol20'] = df['return'].rolling(20).std()
+        df['ret_sq'] = df['return'] ** 2
+        df['sign1'] = df['return'].shift(1).apply(np.sign).fillna(0)
+        return df.dropna()
+
+    def fit(self, returns_df):
+        feature_df = self._create_features(returns_df)
+        X, y = feature_df.drop(columns='return').values, feature_df['return'].values
+        self.y_true_dates = feature_df.index[self.window_size:]
+
+        for t in tqdm(range(self.window_size, len(y)), desc="Fitting TCP"):
+            X_train, y_train = X[t - self.window_size:t], y[t - self.window_size:t]
+            if len(y_train) < 20: continue
+
+            self.low_model.fit(X_train, y_train)
+            self.up_model.fit(X_train, y_train)
+
+            X_curr = X[t].reshape(1, -1)
+            low_p = self.low_model.predict(X_curr)[0]
+            up_p = self.up_model.predict(X_curr)[0]
+
+            low_i = low_p - self.con_thr_low
+            up_i = up_p + self.con_thr_up
+            self.intervals.append([low_i, up_i])
+
+            covered = (y[t] >= low_i) and (y[t] <= up_i)
+            self.coverages.append(covered)
+            err = (0 if covered else 1) - self.alpha
+            self.cover_errs.append(err)
+
+            lr = self._lr(len(self.cover_errs))
+            if y[t] < low_i:
+                self.con_thr_low += lr * abs(err)
+            elif y[t] > up_i:
+                self.con_thr_up += lr * abs(err)
+            else:
+                self.con_thr_low = max(0, self.con_thr_low - lr * 0.1)
+                self.con_thr_up = max(0, self.con_thr_up - lr * 0.1)
+
+        self.intervals = np.array(self.intervals)
+
+
+class QuantileRegressionBaseline:
+    """Static Quantile Regression baseline (Code 2 version)."""
+
+    def __init__(self, alpha=0.05):
+        self.alpha = alpha
+        self.intervals = []
+        self.y_true_dates = None
+        self._init_models()
+
+    def _init_models(self):
+        if USE_LGB:
+            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha / 2, verbose=-1)
+            self.up_model = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha / 2, verbose=-1)
+        else:
+            from sklearn.ensemble import GradientBoostingRegressor
+            self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha / 2)
+            self.up_model = GradientBoostingRegressor(loss='quantile', alpha=1 - self.alpha / 2)
+
+    def _create_features(self, returns_df):
+        df = returns_df.copy()
+        for lag in range(1, 6):
+            df[f'lag_{lag}'] = df['return'].shift(lag)
+        df['vol20'] = df['return'].rolling(20).std()
+        df['ret_sq'] = df['return'] ** 2
+        df['sign1'] = df['return'].shift(1).apply(np.sign).fillna(0)
+        return df.dropna()
+
+    def fit(self, returns_df):
+        feature_df = self._create_features(returns_df)
+        X, y = feature_df.drop(columns='return').values, feature_df['return'].values
+        self.y_true_dates = feature_df.index
+
+        self.low_model.fit(X, y)
+        self.up_model.fit(X, y)
+
+        low_preds = self.low_model.predict(X)
+        up_preds = self.up_model.predict(X)
+        self.intervals = np.vstack([low_preds, up_preds]).T
+
+
+class GARCHModel:
+    """GARCH(1,1) model (Code 2 version)."""
+
+    def __init__(self, alpha=0.05):
+        self.alpha = alpha
+        self.intervals = []
+        self.y_true_dates = None
+
+    def fit(self, returns_df):
+        r = returns_df['return'].values
+        dates = returns_df.index
+        n = len(r)
+        vol = np.zeros(n)
+
+        # Initialize with 50-day std
+        vol[0] = np.std(r[:50]) if n > 50 else np.std(r)
+
+        # GARCH(1,1) updates
+        for t in range(1, n):
+            vol[t] = np.sqrt(1e-6 + 0.05 * r[t - 1] ** 2 + 0.9 * vol[t - 1] ** 2)
+
+        # Create intervals
+        z_score = stats.norm.ppf(1 - self.alpha / 2)
+        self.intervals = np.array([
+            [-z_score * vol[t], z_score * vol[t]]
+            for t in range(50, n)
+        ])
+        self.y_true_dates = dates[50:]
+
+
+class HistoricalSimulation:
+    """Historical Simulation (Code 2 version)."""
+
+    def __init__(self, window_size=252, alpha=0.05):
+        self.window_size, self.alpha = window_size, alpha
+        self.intervals = []
+        self.y_true_dates = None
+
+    def fit(self, returns_df):
+        r = returns_df['return'].values
+        dates = returns_df.index
+        n = len(r)
+
+        self.intervals = [
+            [np.percentile(r[t - self.window_size:t], 100 * self.alpha / 2),
+             np.percentile(r[t - self.window_size:t], 100 * (1 - self.alpha / 2))]
+            for t in range(self.window_size, n)
+        ]
+        self.y_true_dates = dates[self.window_size:]
+
+
+# --- MAIN VISUALIZATION CODE ---
+if __name__ == "__main__":
+    # 1. Load and prepare data
+    df = pd.read_csv('financial_returns.csv', index_col=0, parse_dates=True)
+    sp500_returns = df[['^GSPC']].rename(columns={'^GSPC': 'return'})
+
+    # 2. Fit all models
+    print("Fitting all models...")
+    tcp = TemporalConformalPredictor();
+    tcp.fit(sp500_returns)
+    qr = QuantileRegressionBaseline();
+    qr.fit(sp500_returns)
+    garch = GARCHModel();
+    garch.fit(sp500_returns)
+    hist = HistoricalSimulation();
+    hist.fit(sp500_returns)
+
+    models = {'TCP (Adaptive)': tcp, 'QR (Static)': qr,
+              'GARCH (Parametric)': garch, 'Historical Sim': hist}
+
+    # 3. Create 2x2 plot grid
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    # Define visualization period
+    start_date, end_date = '2020-02-01', '2020-04-30'
+
+    # 4. Plot each model
+    for i, (name, model) in enumerate(models.items()):
+        ax = axes[i]
+
+        # Create plot dataframe
+        model_df = pd.DataFrame(model.intervals, columns=['lower', 'upper'], index=model.y_true_dates)
+        plot_df = sp500_returns.join(model_df, how='inner')
+        viz_period = plot_df.loc[start_date:end_date]
+
+        # Plot interval and returns
+        ax.fill_between(viz_period.index, viz_period['lower'], viz_period['upper'],
+                        color='cornflowerblue', alpha=0.5, label='95% Prediction Interval')
+        ax.plot(viz_period.index, viz_period['return'], color='black', lw=1.0, label='S&P 500 Daily Return')
+
+        # Formatting
+        ax.set_title(name, fontsize=14, pad=10)
+        ax.axhline(0, color='grey', linestyle='--', lw=1)
+        ax.tick_params(axis='x', rotation=45)
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+
+    # 5. Final figure formatting
+    fig.suptitle('Comparison of Prediction Intervals During COVID-19 Crash (Feb-Apr 2020)', fontsize=20, y=1.02)
+    fig.text(0.5, 0.04, 'Date', ha='center', va='center', fontsize=14)
+    fig.text(0.08, 0.5, 'Daily Log Return', ha='center', va='center', rotation='vertical', fontsize=14)
+    fig.tight_layout(rect=[0.1, 0.05, 1, 1])
+
+    # 6. Save figure
+    output_filename = 'all_models_visualization.png'
+    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+    print(f"\nVisualization saved successfully as '{output_filename}'")
