@@ -1,5 +1,5 @@
 # Script to visualize and compare prediction intervals during a volatile period.
-# ALL MODELS NOW MATCH ORIGINAL IMPLEMENTATION FROM CODE 2
+
 
 import pandas as pd
 import numpy as np
@@ -25,7 +25,7 @@ except ImportError:
 # --- MODEL CLASSES ---
 
 class TemporalConformalPredictor:
-    """Implements the Temporal Conformal Prediction (TCP) framework (Code 2 version)."""
+
 
     def __init__(self, window_size=252, alpha=0.05, gamma_0=0.01, lambda_param=0.1, beta=0.7):
         self.window_size, self.alpha = window_size, alpha
@@ -96,7 +96,6 @@ class TemporalConformalPredictor:
 
 
 class QuantileRegressionBaseline:
-    """Static Quantile Regression baseline (Code 2 version)."""
 
     def __init__(self, alpha=0.05):
         self.alpha = alpha
@@ -136,7 +135,7 @@ class QuantileRegressionBaseline:
 
 
 class GARCHModel:
-    """GARCH(1,1) model (Code 2 version)."""
+ 
 
     def __init__(self, alpha=0.05):
         self.alpha = alpha
@@ -166,7 +165,7 @@ class GARCHModel:
 
 
 class HistoricalSimulation:
-    """Historical Simulation (Code 2 version)."""
+   
 
     def __init__(self, window_size=252, alpha=0.05):
         self.window_size, self.alpha = window_size, alpha
