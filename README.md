@@ -28,7 +28,7 @@ cd temporal-conformal-prediction-tcp
 
 ## 🔬 Research Paper
 
-Aich, A., Aich, A.B. (2025). Temporal Conformal Prediction (TCP): A Distribution-Free Statistical and Machine Learning Framework for Adaptive 
+Aich, A., Aich, A.B., Jain, Dipak C. (2025). Temporal Conformal Prediction (TCP): A Distribution-Free Statistical and Machine Learning Framework for Adaptive 
 Risk Forecasting. [Manuscript under review]
 
 ## 📊 Citation
@@ -36,9 +36,10 @@ If you use this code or method in your own work, please cite:
 
 @article{Aich2025TCP,
   title   = {Temporal Conformal Prediction (TCP): A Distribution-Free Statistical and Machine Learning Framework for Adaptive Risk Forecasting},
-  author  = {Aich, Agnideep and Aich, Ashit Baran},
+  author  = {Aich, Agnideep, Aich, Ashit Baran and Jain, Dipak},
   year    = {2025},
   note    = {Manuscript under review}
+  url     = {https://doi.org/10.48550/arXiv.2507.05470}
 }
 
 ## 📬 Contact
