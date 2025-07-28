@@ -39,7 +39,7 @@ If you use this code or method in your own work, please cite:
   author  = {Aich, Agnideep, Aich, Ashit Baran and Jain, Dipak},
   year    = {2025},
   note    = {Manuscript under review}
-  url     = {https://doi.org/10.48550/arXiv.2507.05470}
+  url     = {https://doi.org/10.48550/arXiv.2507.05470 }
 }
 
 ## 📬 Contact
