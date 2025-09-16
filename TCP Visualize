@@ -1,246 +1,374 @@
-# Script to visualize and compare prediction intervals during a volatile period.
+# code2_visualizations.py
+# Visualizations only (TCP, TCP-RM, QR-rolling, GARCH, Hist)
+# -----------------------------------------------------------------------------
+# Produces, per asset, under ./figures/ :
+#   • all_models_visualizationSP.png / BTC.png / G.png  (5 panels: TCP, TCP-RM, QR, GARCH, Hist)
+#   • tcp_vs_tcrm_<ASSET>.png                            (overlay)
+#   • covid_window_metrics_<ASSET>.csv                   (COVID-window cov & width)
+# -----------------------------------------------------------------------------
 
-
-import pandas as pd
+import os, warnings
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import warnings
-from tqdm import tqdm
+import pandas as pd
 from scipy import stats
 
 warnings.filterwarnings('ignore')
 
-# Model selection (LightGBM or sklearn)
 try:
     import lightgbm as lgb
-
     USE_LGB = True
-except ImportError:
-    from sklearn.ensemble import GradientBoostingRegressor
-
+    print("Using LightGBM for quantile regression.")
+except Exception:
+    from sklearn.ensemble import GradientBoostingRegressor  # noqa: F401
     USE_LGB = False
+    print("LightGBM not found. Falling back to scikit-learn's GradientBoostingRegressor.")
 
+# -----------------------
+# Utilities
+# -----------------------
 
-# --- MODEL CLASSES ---
+def ensure_dirs():
+    os.makedirs('figures', exist_ok=True)
+
+def build_features(returns, n_lags=5):
+    s = pd.Series(returns).astype(float)
+    df = pd.DataFrame({'return': s})
+    for lag in range(1, n_lags + 1):
+        df[f'lag_{lag}'] = df['return'].shift(lag)
+    df['vol20'] = df['return'].rolling(20).std()
+    df['ret_sq'] = df['return'] ** 2
+    df['sign1'] = np.sign(df['return'].shift(1))
+    df = df.dropna()
+    X = df.drop(columns='return').values
+    y = df['return'].values
+    return df, X, y
+
+def window_metrics(returns_series, iv_df, start_date, end_date):
+    if iv_df is None or len(iv_df) == 0:
+        return np.nan, np.nan, 0
+    df = pd.DataFrame({'y': returns_series}).join(iv_df, how='inner')
+    win = df.loc[start_date:end_date]
+    if len(win) == 0:
+        return np.nan, np.nan, 0
+    cov = ((win['y'] >= win['lower']) & (win['y'] <= win['upper'])).mean()
+    width = (win['upper'] - win['lower']).mean()
+    return float(cov), float(width), int(len(win))
+
+# -----------------------
+# Models (match Code 1)
+# -----------------------
 
 class TemporalConformalPredictor:
-
-
-    def __init__(self, window_size=252, alpha=0.05, gamma_0=0.01, lambda_param=0.1, beta=0.7):
-        self.window_size, self.alpha = window_size, alpha
-        self.gamma_0, self.lambda_param, self.beta = gamma_0, lambda_param, beta
-        self.con_thr_low, self.con_thr_up = 0.0, 0.0
-        self.cover_errs = []
-        self.intervals = []
-        self.coverages = []
-        self.y_true_dates = None
+    def __init__(self, window_size=252, cal_size=60, alpha=0.05,
+                 gamma_0=0.01, lambda_param=0.1, beta=0.7, n_lags=5,
+                 model_type=None, rm_update=False):
+        assert window_size > cal_size >= 10
+        self.window_size = int(window_size); self.cal_size = int(cal_size)
+        self.alpha = float(alpha); self.gamma_0 = float(gamma_0)
+        self.lambda_param = float(lambda_param); self.beta = float(beta)
+        self.n_lags = int(n_lags)
+        self.model_type = model_type or ('lightgbm' if USE_LGB else 'sklearn')
+        self.rm_update = bool(rm_update)
         self._init_models()
+        self.C_offset = 0.0
+        self.cover_errs, self.coverages, self.intervals = [], [], []
+        self.trace = {'t': [], 'y': [], 'ql': [], 'qu': [], 'C_split': [], 'C_rm': [], 'C_eff': [],
+                      'low': [], 'up': [], 'covered': []}
+        self.feature_index = None
 
     def _init_models(self):
-        if USE_LGB:
-            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha / 2, verbose=-1)
-            self.up_model = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha / 2, verbose=-1)
+        if self.model_type == 'lightgbm' and USE_LGB:
+            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha/2, verbose=-1)
+            self.up_model  = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha/2, verbose=-1)
         else:
             from sklearn.ensemble import GradientBoostingRegressor
-            self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha / 2)
-            self.up_model = GradientBoostingRegressor(loss='quantile', alpha=1 - self.alpha / 2)
+            self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha/2, random_state=0)
+            self.up_model  = GradientBoostingRegressor(loss='quantile', alpha=1 - self.alpha/2, random_state=0)
 
     def _lr(self, t):
-        return self.gamma_0 / (1 + self.lambda_param * t) ** self.beta
+        return self.gamma_0 / (1.0 + self.lambda_param * t) ** self.beta
 
-    def _create_features(self, returns_df):
-        df = returns_df.copy()
-        for lag in range(1, 6):
-            df[f'lag_{lag}'] = df['return'].shift(lag)
-        df['vol20'] = df['return'].rolling(20).std()
-        df['ret_sq'] = df['return'] ** 2
-        df['sign1'] = df['return'].shift(1).apply(np.sign).fillna(0)
-        return df.dropna()
+    def get_trace_df(self, index=None):
+        df = pd.DataFrame(self.trace)
+        if index is not None and len(df) > 0:
+            df['date'] = index[df['t'].values]
+            df = df[['date'] + [c for c in df.columns if c != 'date']]
+        return df
 
-    def fit(self, returns_df):
-        feature_df = self._create_features(returns_df)
-        X, y = feature_df.drop(columns='return').values, feature_df['return'].values
-        self.y_true_dates = feature_df.index[self.window_size:]
+    def fit(self, returns):
+        feat_df, X, y = build_features(returns, n_lags=self.n_lags)
+        self.feature_index = feat_df.index
+        w, m = self.window_size, self.cal_size
+        w_tr = w - m
+        start_idx = w
+        n = len(y)
+        self.cover_errs.clear(); self.coverages.clear(); self.intervals.clear(); self.C_offset = 0.0
+        if n <= start_idx:
+            self.intervals = np.zeros((0, 2)); self.coverages = np.array([]); return
 
-        for t in tqdm(range(self.window_size, len(y)), desc="Fitting TCP"):
-            X_train, y_train = X[t - self.window_size:t], y[t - self.window_size:t]
-            if len(y_train) < 20: continue
+        for t in range(start_idx, n):
+            tr_lo, tr_hi = t - w, t - m
+            cal_lo = t - m
+            Xtr, Ytr = X[tr_lo:tr_hi], y[tr_lo:tr_hi]
+            Xcal, Ycal = X[cal_lo:t], y[cal_lo:t]
+            if len(Ytr) < max(20, w_tr // 4): continue
 
-            self.low_model.fit(X_train, y_train)
-            self.up_model.fit(X_train, y_train)
+            self.low_model.fit(Xtr, Ytr)
+            self.up_model.fit(Xtr, Ytr)
 
-            X_curr = X[t].reshape(1, -1)
-            low_p = self.low_model.predict(X_curr)[0]
-            up_p = self.up_model.predict(X_curr)[0]
+            ql_cal = self.low_model.predict(Xcal)
+            qu_cal = self.up_model.predict(Xcal)
+            s_cal = np.maximum.reduce([ql_cal - Ycal, Ycal - qu_cal, np.zeros_like(Ycal)])
+            m_eff = len(s_cal)
+            if m_eff == 0: continue
+            s_sorted = np.sort(s_cal)
+            k = int(np.ceil((m_eff + 1) * (1 - self.alpha)))
+            k = min(max(k, 1), m_eff)
+            C_split = s_sorted[k - 1]
 
-            low_i = low_p - self.con_thr_low
-            up_i = up_p + self.con_thr_up
+            ql = float(self.low_model.predict(X[t].reshape(1, -1))[0])
+            qu = float(self.up_model.predict(X[t].reshape(1, -1))[0])
+            C_rm = float(self.C_offset) if self.rm_update else 0.0
+            C_eff = C_split + C_rm
+            low_i, up_i = ql - C_eff, qu + C_eff
             self.intervals.append([low_i, up_i])
 
-            covered = (y[t] >= low_i) and (y[t] <= up_i)
+            yt = y[t]
+            covered = (yt >= low_i) and (yt <= up_i)
             self.coverages.append(covered)
             err = (0 if covered else 1) - self.alpha
             self.cover_errs.append(err)
+            if self.rm_update:
+                lr = self._lr(len(self.cover_errs))
+                self.C_offset += lr * err
+                self.C_offset = max(self.C_offset, -C_split)
 
-            lr = self._lr(len(self.cover_errs))
-            if y[t] < low_i:
-                self.con_thr_low += lr * abs(err)
-            elif y[t] > up_i:
-                self.con_thr_up += lr * abs(err)
-            else:
-                self.con_thr_low = max(0, self.con_thr_low - lr * 0.1)
-                self.con_thr_up = max(0, self.con_thr_up - lr * 0.1)
+            tr = self.trace
+            tr['t'].append(t); tr['y'].append(yt); tr['ql'].append(ql); tr['qu'].append(qu)
+            tr['C_split'].append(C_split); tr['C_rm'].append(C_rm); tr['C_eff'].append(C_eff)
+            tr['low'].append(low_i); tr['up'].append(up_i); tr['covered'].append(covered)
 
-        self.intervals = np.array(self.intervals)
+        self.intervals = np.array(self.intervals); self.coverages = np.array(self.coverages, dtype=bool)
 
+    def intervals_df(self, date_index):
+        if len(self.intervals) == 0:
+            return pd.DataFrame(columns=['lower','upper'])
+        aligned_dates = pd.Index(date_index)[self.feature_index]
+        tpos = np.array(self.trace['t'], dtype=int)
+        pred_dates = aligned_dates[tpos]
+        return pd.DataFrame(self.intervals, columns=['lower','upper'], index=pred_dates)
 
-class QuantileRegressionBaseline:
-
-    def __init__(self, alpha=0.05):
-        self.alpha = alpha
-        self.intervals = []
-        self.y_true_dates = None
+class QuantileRegressionRolling:
+    def __init__(self, alpha=0.05, n_lags=5, train_window=192, model_type=None):
+        self.alpha = float(alpha); self.n_lags = int(n_lags)
+        self.train_window = int(train_window)
+        self.model_type = model_type or ('lightgbm' if USE_LGB else 'sklearn')
         self._init_models()
+        self.intervals = None
+        self.feature_index = None
+        self.pred_positions = None  # positions in feature rows used for predictions
 
     def _init_models(self):
-        if USE_LGB:
-            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha / 2, verbose=-1)
-            self.up_model = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha / 2, verbose=-1)
+        if self.model_type == 'lightgbm' and USE_LGB:
+            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha/2, verbose=-1)
+            self.up_model  = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha/2, verbose=-1)
         else:
             from sklearn.ensemble import GradientBoostingRegressor
-            self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha / 2)
-            self.up_model = GradientBoostingRegressor(loss='quantile', alpha=1 - self.alpha / 2)
+            self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha/2, random_state=0)
+            self.up_model  = GradientBoostingRegressor(loss='quantile', alpha=1 - self.alpha/2, random_state=0)
 
-    def _create_features(self, returns_df):
-        df = returns_df.copy()
-        for lag in range(1, 6):
-            df[f'lag_{lag}'] = df['return'].shift(lag)
-        df['vol20'] = df['return'].rolling(20).std()
-        df['ret_sq'] = df['return'] ** 2
-        df['sign1'] = df['return'].shift(1).apply(np.sign).fillna(0)
-        return df.dropna()
+    def fit(self, returns):
+        feat_df, X, y = build_features(returns, n_lags=self.n_lags)
+        self.feature_index = feat_df.index
+        n = len(y); w = self.train_window
+        if n <= w:
+            self.intervals = np.zeros((0, 2)); self.pred_positions = []
+            return
+        iv = []
+        for t in range(w, n):
+            Xtr, Ytr = X[t-w:t], y[t-w:t]
+            self.low_model.fit(Xtr, Ytr); self.up_model.fit(Xtr, Ytr)
+            ql = float(self.low_model.predict(X[t].reshape(1, -1))[0])
+            qu = float(self.up_model.predict(X[t].reshape(1, -1))[0])
+            iv.append([ql, qu])
+        self.intervals = np.array(iv)
+        self.pred_positions = list(range(w, n))
 
-    def fit(self, returns_df):
-        feature_df = self._create_features(returns_df)
-        X, y = feature_df.drop(columns='return').values, feature_df['return'].values
-        self.y_true_dates = feature_df.index
-
-        self.low_model.fit(X, y)
-        self.up_model.fit(X, y)
-
-        low_preds = self.low_model.predict(X)
-        up_preds = self.up_model.predict(X)
-        self.intervals = np.vstack([low_preds, up_preds]).T
-
+    def intervals_df(self, date_index):
+        if self.intervals is None or len(self.intervals) == 0:
+            return pd.DataFrame(columns=['lower','upper'])
+        aligned = pd.Index(date_index)[self.feature_index]
+        pred_dates = aligned[self.pred_positions]
+        return pd.DataFrame(self.intervals, columns=['lower','upper'], index=pred_dates)
 
 class GARCHModel:
- 
-
     def __init__(self, alpha=0.05):
-        self.alpha = alpha
-        self.intervals = []
-        self.y_true_dates = None
-
-    def fit(self, returns_df):
-        r = returns_df['return'].values
-        dates = returns_df.index
-        n = len(r)
-        vol = np.zeros(n)
-
-        # Initialize with 50-day std
-        vol[0] = np.std(r[:50]) if n > 50 else np.std(r)
-
-        # GARCH(1,1) updates
+        self.alpha = alpha; self.intervals = None; self.start_idx = 50
+    def fit(self, returns):
+        r = np.asarray(returns, dtype=float); n = len(r)
+        if n < 60: self.intervals = np.zeros((0,2)); return
+        vol = np.zeros(n); vol[0] = np.std(r[:50]) if n > 50 else max(np.std(r), 1e-6)
         for t in range(1, n):
-            vol[t] = np.sqrt(1e-6 + 0.05 * r[t - 1] ** 2 + 0.9 * vol[t - 1] ** 2)
-
-        # Create intervals
-        z_score = stats.norm.ppf(1 - self.alpha / 2)
-        self.intervals = np.array([
-            [-z_score * vol[t], z_score * vol[t]]
-            for t in range(50, n)
-        ])
-        self.y_true_dates = dates[50:]
-
+            vol[t] = np.sqrt(1e-6 + 0.05*r[t-1]**2 + 0.9*vol[t-1]**2)
+        z = stats.norm.ppf(1 - self.alpha/2.0)
+        self.intervals = np.array([[-z*vol[t], z*vol[t]] for t in range(self.start_idx, n)])
+    def intervals_df(self, date_index):
+        if self.intervals is None or len(self.intervals) == 0:
+            return pd.DataFrame(columns=['lower','upper'])
+        return pd.DataFrame(self.intervals, columns=['lower','upper'], index=pd.Index(date_index)[self.start_idx:])
 
 class HistoricalSimulation:
-   
-
     def __init__(self, window_size=252, alpha=0.05):
-        self.window_size, self.alpha = window_size, alpha
-        self.intervals = []
-        self.y_true_dates = None
+        self.window_size = int(window_size); self.alpha = float(alpha); self.intervals=None
+    def fit(self, returns):
+        r = np.asarray(returns, dtype=float); n = len(r)
+        if n <= self.window_size: self.intervals = np.zeros((0,2)); return
+        lows, ups = [], []
+        for t in range(self.window_size, n):
+            w = r[t-self.window_size:t]
+            lows.append(np.percentile(w, 100*self.alpha/2.0))
+            ups.append(np.percentile(w, 100*(1 - self.alpha/2.0)))
+        self.intervals = np.column_stack([lows, ups])
+    def intervals_df(self, date_index):
+        if self.intervals is None or len(self.intervals) == 0:
+            return pd.DataFrame(columns=['lower','upper'])
+        return pd.DataFrame(self.intervals, columns=['lower','upper'], index=pd.Index(date_index)[self.window_size:])
 
-    def fit(self, returns_df):
-        r = returns_df['return'].values
-        dates = returns_df.index
-        n = len(r)
+# -----------------------
+# Plotting
+# -----------------------
 
-        self.intervals = [
-            [np.percentile(r[t - self.window_size:t], 100 * self.alpha / 2),
-             np.percentile(r[t - self.window_size:t], 100 * (1 - self.alpha / 2))]
-            for t in range(self.window_size, n)
-        ]
-        self.y_true_dates = dates[self.window_size:]
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
+plt.rcParams.update({
+    'figure.dpi': 140,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.titlesize': 13,
+    'axes.labelsize': 12
+})
 
-# --- MAIN VISUALIZATION CODE ---
-if __name__ == "__main__":
-    # 1. Load and prepare data
-    df = pd.read_csv('financial_returns.csv', index_col=0, parse_dates=True)
-    sp500_returns = df[['^GSPC']].rename(columns={'^GSPC': 'return'})
+def _panel(ax, title, returns_series, df_iv, start_date, end_date):
+    plot_df = pd.DataFrame({'return': returns_series}).join(df_iv, how='inner')
+    viz = plot_df.loc[start_date:end_date]
+    if len(viz) == 0:
+        ax.set_title(f"{title} (no data)"); ax.axhline(0, color='grey', ls='--', lw=0.8); return
+    covered = (viz['return'] >= viz['lower']) & (viz['return'] <= viz['upper'])
+    misses = viz[~covered]
+    ax.fill_between(viz.index, viz['lower'], viz['upper'], alpha=0.35, label='95% Interval')
+    ax.plot(viz.index, viz['return'], lw=0.9, color='black', label='Return')
+    if len(misses) > 0:
+        ax.scatter(misses.index, misses['return'], s=16, color='red', zorder=5)
+    cov, width, n = window_metrics(returns_series, df_iv, start_date, end_date)
+    ax.set_title(f"{title}\nCOVID window: cov={cov:.3f}, width={width:.3f}, n={n}")
+    ax.axhline(0, color='grey', ls='--', lw=0.8)
+    ax.xaxis.set_major_locator(mdates.MonthLocator()); ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+    ax.tick_params(axis='x', rotation=45)
 
-    # 2. Fit all models
-    print("Fitting all models...")
-    tcp = TemporalConformalPredictor();
-    tcp.fit(sp500_returns)
-    qr = QuantileRegressionBaseline();
-    qr.fit(sp500_returns)
-    garch = GARCHModel();
-    garch.fit(sp500_returns)
-    hist = HistoricalSimulation();
-    hist.fit(sp500_returns)
-
-    models = {'TCP (Adaptive)': tcp, 'QR (Static)': qr,
-              'GARCH (Parametric)': garch, 'Historical Sim': hist}
-
-    # 3. Create 2x2 plot grid
-    plt.style.use('seaborn-v0_8-whitegrid')
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12), sharex=True, sharey=True)
+def plot_all_models_grid(series_name, returns_series, model_dfs, start_date, end_date, outfile):
+    fig, axes = plt.subplots(3, 2, figsize=(12, 11), sharex=True, sharey=True)
     axes = axes.flatten()
+    order = [
+        ('TCP (Adaptive)', 'TCP'),
+        ('TCP-RM (Adaptive+RM)', 'TCP-RM'),
+        ('QR (Rolling)', 'QR'),
+        ('GARCH (Parametric)', 'GARCH'),
+        ('Historical Sim', 'Hist')
+    ]
+    for ax_idx, (title, key) in enumerate(order):
+        _panel(axes[ax_idx], title, returns_series, model_dfs[key], start_date, end_date)
+    axes[-1].axis('off')
+    fig.suptitle(f'{series_name}: Model Intervals During COVID-19 Crash (Feb–Apr 2020)', y=0.98)
+    fig.tight_layout(rect=[0.05, 0.05, 0.98, 0.95])
+    fig.text(0.5, 0.01, 'Date', ha='center'); fig.text(0.01, 0.5, 'Daily Log Return', va='center', rotation='vertical')
+    fig.savefig(outfile, bbox_inches='tight'); plt.close(fig); print(f"Saved: {outfile}")
 
-    # Define visualization period
-    start_date, end_date = '2020-02-01', '2020-04-30'
+def plot_tcp_vs_tcrm_overlay(series_name, returns_series, iv_tcp, iv_tcrm, start_date, end_date, outfile):
+    plt.figure(figsize=(12, 4.2))
+    plot_df = pd.DataFrame({'return': returns_series})
+    tcp_df  = plot_df.join(iv_tcp,  how='inner').rename(columns={'lower':'tcp_low','upper':'tcp_up'})
+    tcrm_df = plot_df.join(iv_tcrm, how='inner').rename(columns={'lower':'tcrm_low','upper':'tcrm_up'})
+    viz_tcp  = tcp_df.loc[start_date:end_date]
+    viz_tcrm = tcrm_df.loc[start_date:end_date]
+    viz_ret  = plot_df.loc[start_date:end_date]
+    if len(viz_tcp) > 0:
+        plt.fill_between(viz_tcp.index, viz_tcp['tcp_low'], viz_tcp['tcp_up'], alpha=0.28, label='TCP 95% Interval')
+    if len(viz_tcrm) > 0:
+        plt.plot(viz_tcrm.index, viz_tcrm['tcrm_low'], lw=1.0, label='TCP-RM low')
+        plt.plot(viz_tcrm.index, viz_tcrm['tcrm_up'],  lw=1.0, label='TCP-RM up')
+    if len(viz_ret) > 0:
+        plt.plot(viz_ret.index, viz_ret['return'], lw=0.9, color='black', label='Return')
+    plt.axhline(0, color='grey', ls='--', lw=0.8)
+    plt.title(f'{series_name}: TCP vs TCP-RM during COVID (Feb–Apr 2020)')
+    plt.legend(loc='upper right', ncol=2, fontsize=9); plt.xticks(rotation=45)
+    ax = plt.gca(); ax.xaxis.set_major_locator(mdates.MonthLocator()); ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+    plt.ylabel('Daily Log Return'); plt.tight_layout(); plt.savefig(outfile, bbox_inches='tight'); plt.close()
+    print(f"Saved: {outfile}")
 
-    # 4. Plot each model
-    for i, (name, model) in enumerate(models.items()):
-        ax = axes[i]
+# -----------------------
+# Orchestration
+# -----------------------
 
-        # Create plot dataframe
-        model_df = pd.DataFrame(model.intervals, columns=['lower', 'upper'], index=model.y_true_dates)
-        plot_df = sp500_returns.join(model_df, how='inner')
-        viz_period = plot_df.loc[start_date:end_date]
+def run_visuals_for_series(series_name, rets, dates, crash_start, crash_end):
+    tcp   = TemporalConformalPredictor(rm_update=False)
+    tcrm  = TemporalConformalPredictor(rm_update=True)
+    qr    = QuantileRegressionRolling(train_window=252-60)
+    garch = GARCHModel()
+    hist  = HistoricalSimulation()
 
-        # Plot interval and returns
-        ax.fill_between(viz_period.index, viz_period['lower'], viz_period['upper'],
-                        color='cornflowerblue', alpha=0.5, label='95% Prediction Interval')
-        ax.plot(viz_period.index, viz_period['return'], color='black', lw=1.0, label='S&P 500 Daily Return')
+    print(f"\nFitting models for {series_name}…")
+    tcp.fit(rets); tcrm.fit(rets); qr.fit(rets); garch.fit(rets); hist.fit(rets)
 
-        # Formatting
-        ax.set_title(name, fontsize=14, pad=10)
-        ax.axhline(0, color='grey', linestyle='--', lw=1)
-        ax.tick_params(axis='x', rotation=45)
-        ax.xaxis.set_major_locator(mdates.MonthLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+    returns_series = pd.Series(rets, index=pd.Index(dates), name='return')
+    iv_tcp   = tcp.intervals_df(pd.Index(dates))
+    iv_tcrm  = tcrm.intervals_df(pd.Index(dates))
+    iv_qr    = qr.intervals_df(pd.Index(dates))
+    iv_garch = garch.intervals_df(pd.Index(dates))
+    iv_hist  = hist.intervals_df(pd.Index(dates))
 
-    # 5. Final figure formatting
-    fig.suptitle('Comparison of Prediction Intervals During COVID-19 Crash (Feb-Apr 2020)', fontsize=20, y=1.02)
-    fig.text(0.5, 0.04, 'Date', ha='center', va='center', fontsize=14)
-    fig.text(0.08, 0.5, 'Daily Log Return', ha='center', va='center', rotation='vertical', fontsize=14)
-    fig.tight_layout(rect=[0.1, 0.05, 1, 1])
+    model_dfs = {'TCP': iv_tcp, 'TCP-RM': iv_tcrm, 'QR': iv_qr, 'GARCH': iv_garch, 'Hist': iv_hist}
 
-    # 6. Save figure
-    output_filename = 'all_models_visualization.png'
-    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
-    print(f"\nVisualization saved successfully as '{output_filename}'")
+    if series_name.upper() in ['SP500', '^GSPC']:
+        grid_out = 'figures/all_models_visualizationSP.png'; overlay_out = 'figures/tcp_vs_tcrm_SP500.png'
+    elif series_name.upper() in ['BTC-USD', 'BTC', 'BTCUSD']:
+        grid_out = 'figures/all_models_visualizationBTC.png'; overlay_out = 'figures/tcp_vs_tcrm_BTC-USD.png'
+    elif series_name.title() == 'Gold' or series_name.upper() == 'GC=F':
+        grid_out = 'figures/all_models_visualizationG.png'; overlay_out = 'figures/tcp_vs_tcrm_Gold.png'
+    else:
+        grid_out = f'figures/all_models_visualization_{series_name}.png'; overlay_out = f'figures/tcp_vs_tcrm_{series_name}.png'
+
+    plot_all_models_grid(series_name, returns_series, model_dfs, crash_start, crash_end, grid_out)
+    plot_tcp_vs_tcrm_overlay(series_name, returns_series, iv_tcp, iv_tcrm, crash_start, crash_end, overlay_out)
+
+    # Save COVID-window metrics to CSV
+    cov_tcp, w_tcp, n_tcp   = window_metrics(returns_series, iv_tcp,  crash_start, crash_end)
+    cov_tcrm, w_tcrm, n_trm = window_metrics(returns_series, iv_tcrm, crash_start, crash_end)
+    cov_qr, w_qr, n_qr      = window_metrics(returns_series, iv_qr,   crash_start, crash_end)
+    cov_ga, w_ga, n_ga      = window_metrics(returns_series, iv_garch,crash_start, crash_end)
+    cov_hi, w_hi, n_hi      = window_metrics(returns_series, iv_hist, crash_start, crash_end)
+    pd.DataFrame([{'model':'TCP','cov':cov_tcp,'width':w_tcp,'n':n_tcp},
+                  {'model':'TCP-RM','cov':cov_tcrm,'width':w_tcrm,'n':n_trm},
+                  {'model':'QR(rolling)','cov':cov_qr,'width':w_qr,'n':n_qr},
+                  {'model':'GARCH','cov':cov_ga,'width':w_ga,'n':n_ga},
+                  {'model':'Hist','cov':cov_hi,'width':w_hi,'n':n_hi}]).to_csv(
+        f'figures/covid_window_metrics_{series_name}.csv', index=False, float_format='%.4f')
+
+if __name__ == '__main__':
+    ensure_dirs()
+    try:
+        df = pd.read_csv('financial_returns.csv', index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        raise SystemExit("Error: 'financial_returns.csv' not found.")
+    df.rename(columns={'^GSPC': 'SP500', 'GC=F': 'Gold'}, inplace=True)
+
+    series_order = ['SP500', 'BTC-USD', 'Gold']
+    crash_start, crash_end = '2020-02-01', '2020-04-30'
+
+    for series in series_order:
+        if series not in df.columns:
+            print(f"Warning: Series '{series}' not found. Skipping."); continue
+        ser = df[series].dropna()
+        run_visuals_for_series(series, ser.values, ser.index, crash_start, crash_end)
+
+    print("\nAll visualizations saved in ./figures/")
