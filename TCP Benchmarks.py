@@ -14,9 +14,16 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import warnings
-from tqdm import tqdm
+
 
 warnings.filterwarnings('ignore')
+
+# tqdm with safe fallback (no hard dependency)
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(x, **k):
+        return x
 
 # Prefer LightGBM; fallback to sklearn
 try:
@@ -63,13 +70,21 @@ def build_features(returns, n_lags=5):
     df = pd.DataFrame({'return': s})
     for lag in range(1, n_lags + 1):
         df[f'lag_{lag}'] = df['return'].shift(lag)
-    df['vol20'] = df['return'].rolling(20).std()
-    df['ret_sq'] = df['return'] ** 2
-    df['sign1'] = np.sign(df['return'].shift(1))
+
+    # BEFORE (leakage):
+    # df['vol20']  = df['return'].rolling(20).std()
+    # df['ret_sq'] = df['return'] ** 2
+
+    # AFTER (no leakage; only info available before t)
+    df['vol20']  = df['return'].shift(1).rolling(20).std()  # uses r_{t-1},...,r_{t-20}
+    df['ret_sq'] = df['return'].shift(1) ** 2               # r_{t-1}^2
+
+    df['sign1']  = np.sign(df['return'].shift(1))
     df = df.dropna()
     X = df.drop(columns='return').values
     y = df['return'].values
     return df, X, y
+
 
 # ==============================
 # TCP / TCP-RM
@@ -98,8 +113,12 @@ class TemporalConformalPredictor:
 
     def _init_models(self):
         if self.model_type == 'lightgbm' and USE_LGB:
-            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha/2, verbose=-1)
-            self.up_model  = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha/2, verbose=-1)
+            self.low_model = lgb.LGBMRegressor(
+                objective='quantile', alpha=self.alpha / 2, random_state=0, verbose=-1
+            )
+            self.up_model = lgb.LGBMRegressor(
+                objective='quantile', alpha=1 - self.alpha / 2, random_state=0, verbose=-1
+            )
         else:
             from sklearn.ensemble import GradientBoostingRegressor
             self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha/2, random_state=0)
@@ -202,8 +221,13 @@ class QuantileRegressionRolling:
 
     def _init_models(self):
         if self.model_type == 'lightgbm' and USE_LGB:
-            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=self.alpha/2, verbose=-1)
-            self.up_model  = lgb.LGBMRegressor(objective='quantile', alpha=1 - self.alpha/2, verbose=-1)
+            self.low_model = lgb.LGBMRegressor(
+                objective='quantile', alpha=self.alpha / 2, random_state=0, verbose=-1
+            )
+            self.up_model = lgb.LGBMRegressor(
+                objective='quantile', alpha=1 - self.alpha / 2, random_state=0, verbose=-1
+            )
+
         else:
             from sklearn.ensemble import GradientBoostingRegressor
             self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha/2, random_state=0)
