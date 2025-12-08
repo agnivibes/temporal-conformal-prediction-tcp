@@ -1,11 +1,5 @@
 # code2_visualizations.py
-# Visualizations only (TCP, TCP-RM, QR-rolling, GARCH, Hist)
-# -----------------------------------------------------------------------------
-# Produces, per asset, under ./figures/ :
-#   • all_models_visualizationSP.png / BTC.png / G.png  (5 panels: TCP, TCP-RM, QR, GARCH, Hist)
-#   • tcp_vs_tcrm_<ASSET>.png                            (overlay)
-#   • covid_window_metrics_<ASSET>.csv                   (COVID-window cov & width)
-# -----------------------------------------------------------------------------
+# Visualizations (TCP, TCP-RM, QR-rolling, GARCH, Hist, ACI)
 
 import os, warnings
 import numpy as np
@@ -20,8 +14,6 @@ try:
 except Exception:
     def tqdm(x, **k):
         return x
-
-warnings.filterwarnings('ignore')
 
 try:
     import lightgbm as lgb
@@ -45,16 +37,15 @@ def build_features(returns, n_lags=5):
     for lag in range(1, n_lags + 1):
         df[f'lag_{lag}'] = df['return'].shift(lag)
 
-    # (no leakage; only info available before t)
-    df['vol20']  = df['return'].shift(1).rolling(20).std()  # uses r_{t-1},...,r_{t-20}
-    df['ret_sq'] = df['return'].shift(1) ** 2               # r_{t-1}^2
-
+    # no leakage; only info available before t
+    df['vol20']  = df['return'].shift(1).rolling(20).std()   # r_{t-1},...,r_{t-20}
+    df['ret_sq'] = df['return'].shift(1) ** 2                # r_{t-1}^2
     df['sign1']  = np.sign(df['return'].shift(1))
+
     df = df.dropna()
     X = df.drop(columns='return').values
     y = df['return'].values
     return df, X, y
-
 
 def window_metrics(returns_series, iv_df, start_date, end_date):
     if iv_df is None or len(iv_df) == 0:
@@ -68,7 +59,7 @@ def window_metrics(returns_series, iv_df, start_date, end_date):
     return float(cov), float(width), int(len(win))
 
 # -----------------------
-# Models (match Code 1)
+# Models (match benchmarks)
 # -----------------------
 
 class TemporalConformalPredictor:
@@ -97,7 +88,6 @@ class TemporalConformalPredictor:
             self.up_model = lgb.LGBMRegressor(
                 objective='quantile', alpha=1 - self.alpha / 2, random_state=0, verbose=-1
             )
-
         else:
             from sklearn.ensemble import GradientBoostingRegressor
             self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha/2, random_state=0)
@@ -184,7 +174,7 @@ class QuantileRegressionRolling:
         self._init_models()
         self.intervals = None
         self.feature_index = None
-        self.pred_positions = None  # positions in feature rows used for predictions
+        self.pred_positions = None
 
     def _init_models(self):
         if self.model_type == 'lightgbm' and USE_LGB:
@@ -194,7 +184,6 @@ class QuantileRegressionRolling:
             self.up_model = lgb.LGBMRegressor(
                 objective='quantile', alpha=1 - self.alpha / 2, random_state=0, verbose=-1
             )
-
         else:
             from sklearn.ensemble import GradientBoostingRegressor
             self.low_model = GradientBoostingRegressor(loss='quantile', alpha=self.alpha/2, random_state=0)
@@ -258,6 +247,115 @@ class HistoricalSimulation:
         return pd.DataFrame(self.intervals, columns=['lower','upper'], index=pd.Index(date_index)[self.window_size:])
 
 # -----------------------
+# ACI baseline (adaptive alpha_t; threshold via split-conformal in rolling window)
+# -----------------------
+
+class AdaptiveConformalInferenceRolling:
+    """
+    Simple ACI-style baseline:
+      - Same rolling window (w) and calibration (m) as TCP.
+      - Uses split conformal, but adapts the target miscoverage alpha_t online.
+      - alpha_{t+1} = clip(alpha_t + eta * ((1 - alpha_t) - 1{covered}), [amin, amax])
+    Produces intervals like others for visualization parity.
+    """
+    def __init__(self, window_size=252, cal_size=60, alpha0=0.05, eta=0.02,
+                 n_lags=5, model_type=None, alpha_min=0.01, alpha_max=0.20):
+        assert window_size > cal_size >= 10
+        self.window_size = int(window_size); self.cal_size = int(cal_size)
+        self.alpha0 = float(alpha0); self.eta = float(eta)
+        self.alpha_min = float(alpha_min); self.alpha_max = float(alpha_max)
+        self.n_lags = int(n_lags)
+        self.model_type = model_type or ('lightgbm' if USE_LGB else 'sklearn')
+        self._init_models()
+        self.intervals = []
+        self.trace = {'t': [], 'alpha_t': [], 'C_split': [], 'low': [], 'up': [], 'covered': []}
+        self.feature_index = None
+
+    def _init_models(self):
+        if self.model_type == 'lightgbm' and USE_LGB:
+            self.low_model = lgb.LGBMRegressor(objective='quantile', alpha=0.5, random_state=0, verbose=-1)
+            self.up_model  = lgb.LGBMRegressor(objective='quantile', alpha=0.5, random_state=0, verbose=-1)
+        else:
+            from sklearn.ensemble import GradientBoostingRegressor
+            # we will set alpha at predict-time by refitting per window
+            self.low_model = GradientBoostingRegressor(loss='quantile', alpha=0.5, random_state=0)
+            self.up_model  = GradientBoostingRegressor(loss='quantile', alpha=0.5, random_state=0)
+
+    def fit(self, returns):
+        feat_df, X, y = build_features(returns, n_lags=self.n_lags)
+        self.feature_index = feat_df.index
+        w, m = self.window_size, self.cal_size
+        w_tr = w - m
+        start_idx = w
+        n = len(y)
+        self.intervals.clear()
+        if n <= start_idx:
+            self.intervals = np.zeros((0, 2)); return
+
+        alpha_t = self.alpha0
+        for t in range(start_idx, n):
+            tr_lo, tr_hi = t - w, t - m
+            cal_lo = t - m
+            Xtr, Ytr = X[tr_lo:tr_hi], y[tr_lo:tr_hi]
+            Xcal, Ycal = X[cal_lo:t], y[cal_lo:t]
+            if len(Ytr) < max(20, w_tr // 4): continue
+
+            # set quantile levels based on fixed 2-sided split around alpha_t
+            a_low  = alpha_t / 2.0
+            a_high = 1.0 - alpha_t / 2.0
+
+            # re-initialize models with desired quantiles (keeps behavior consistent with TCP forecaster)
+            if USE_LGB and isinstance(self.low_model, lgb.LGBMRegressor):
+                self.low_model.set_params(alpha=a_low)
+                self.up_model.set_params(alpha=a_high)
+            else:
+                from sklearn.ensemble import GradientBoostingRegressor
+                self.low_model = GradientBoostingRegressor(loss='quantile', alpha=a_low, random_state=0)
+                self.up_model  = GradientBoostingRegressor(loss='quantile', alpha=a_high, random_state=0)
+
+            self.low_model.fit(Xtr, Ytr)
+            self.up_model.fit(Xtr, Ytr)
+
+            # split-conformal threshold using current alpha_t
+            ql_cal = self.low_model.predict(Xcal)
+            qu_cal = self.up_model.predict(Xcal)
+            s_cal = np.maximum.reduce([ql_cal - Ycal, Ycal - qu_cal, np.zeros_like(Ycal)])
+
+            m_eff = len(s_cal)
+            if m_eff == 0: continue
+            s_sorted = np.sort(s_cal)
+            k = int(np.ceil((m_eff + 1) * (1 - alpha_t)))
+            k = min(max(k, 1), m_eff)
+            C_split = s_sorted[k - 1]
+
+            ql = float(self.low_model.predict(X[t].reshape(1, -1))[0])
+            qu = float(self.up_model.predict(X[t].reshape(1, -1))[0])
+            low_i, up_i = ql - C_split, qu + C_split
+            self.intervals.append([low_i, up_i])
+
+            yt = y[t]
+            covered = (yt >= low_i) and (yt <= up_i)
+
+            # ACI-style alpha update
+            target_cov = 1.0 - alpha_t
+            cov_err = (1.0 if covered else 0.0) - target_cov
+            alpha_t = np.clip(alpha_t + self.eta * (-cov_err), self.alpha_min, self.alpha_max)
+
+            tr = self.trace
+            tr['t'].append(t); tr['alpha_t'].append(alpha_t); tr['C_split'].append(C_split)
+            tr['low'].append(low_i); tr['up'].append(up_i); tr['covered'].append(covered)
+
+        self.intervals = np.array(self.intervals)
+
+    def intervals_df(self, date_index):
+        if self.intervals is None or len(self.intervals) == 0:
+            return pd.DataFrame(columns=['lower','upper'])
+        aligned_dates = pd.Index(date_index)[self.feature_index]
+        tpos = np.array(self.trace['t'], dtype=int)
+        pred_dates = aligned_dates[tpos]
+        return pd.DataFrame(self.intervals, columns=['lower','upper'], index=pred_dates)
+
+# -----------------------
 # Plotting
 # -----------------------
 
@@ -297,11 +395,11 @@ def plot_all_models_grid(series_name, returns_series, model_dfs, start_date, end
         ('TCP-RM (Adaptive+RM)', 'TCP-RM'),
         ('QR (Rolling)', 'QR'),
         ('GARCH (Parametric)', 'GARCH'),
-        ('Historical Sim', 'Hist')
+        ('Historical Sim', 'Hist'),
+        ('ACI (Adaptive α)', 'ACI'),
     ]
     for ax_idx, (title, key) in enumerate(order):
         _panel(axes[ax_idx], title, returns_series, model_dfs[key], start_date, end_date)
-    axes[-1].axis('off')
     fig.suptitle(f'{series_name}: Model Intervals During COVID-19 Crash (Feb–Apr 2020)', y=0.98)
     fig.tight_layout(rect=[0.05, 0.05, 0.98, 0.95])
     fig.text(0.5, 0.01, 'Date', ha='center'); fig.text(0.01, 0.5, 'Daily Log Return', va='center', rotation='vertical')
@@ -339,9 +437,10 @@ def run_visuals_for_series(series_name, rets, dates, crash_start, crash_end):
     qr    = QuantileRegressionRolling(train_window=252-60)
     garch = GARCHModel()
     hist  = HistoricalSimulation()
+    aci   = AdaptiveConformalInferenceRolling(window_size=252, cal_size=60, alpha0=0.05, eta=0.02)
 
     print(f"\nFitting models for {series_name}…")
-    tcp.fit(rets); tcrm.fit(rets); qr.fit(rets); garch.fit(rets); hist.fit(rets)
+    tcp.fit(rets); tcrm.fit(rets); qr.fit(rets); garch.fit(rets); hist.fit(rets); aci.fit(rets)
 
     returns_series = pd.Series(rets, index=pd.Index(dates), name='return')
     iv_tcp   = tcp.intervals_df(pd.Index(dates))
@@ -349,8 +448,9 @@ def run_visuals_for_series(series_name, rets, dates, crash_start, crash_end):
     iv_qr    = qr.intervals_df(pd.Index(dates))
     iv_garch = garch.intervals_df(pd.Index(dates))
     iv_hist  = hist.intervals_df(pd.Index(dates))
+    iv_aci   = aci.intervals_df(pd.Index(dates))
 
-    model_dfs = {'TCP': iv_tcp, 'TCP-RM': iv_tcrm, 'QR': iv_qr, 'GARCH': iv_garch, 'Hist': iv_hist}
+    model_dfs = {'TCP': iv_tcp, 'TCP-RM': iv_tcrm, 'QR': iv_qr, 'GARCH': iv_garch, 'Hist': iv_hist, 'ACI': iv_aci}
 
     if series_name.upper() in ['SP500', '^GSPC']:
         grid_out = 'figures/all_models_visualizationSP.png'; overlay_out = 'figures/tcp_vs_tcrm_SP500.png'
@@ -364,18 +464,14 @@ def run_visuals_for_series(series_name, rets, dates, crash_start, crash_end):
     plot_all_models_grid(series_name, returns_series, model_dfs, crash_start, crash_end, grid_out)
     plot_tcp_vs_tcrm_overlay(series_name, returns_series, iv_tcp, iv_tcrm, crash_start, crash_end, overlay_out)
 
-    # Save COVID-window metrics to CSV
-    cov_tcp, w_tcp, n_tcp   = window_metrics(returns_series, iv_tcp,  crash_start, crash_end)
-    cov_tcrm, w_tcrm, n_trm = window_metrics(returns_series, iv_tcrm, crash_start, crash_end)
-    cov_qr, w_qr, n_qr      = window_metrics(returns_series, iv_qr,   crash_start, crash_end)
-    cov_ga, w_ga, n_ga      = window_metrics(returns_series, iv_garch,crash_start, crash_end)
-    cov_hi, w_hi, n_hi      = window_metrics(returns_series, iv_hist, crash_start, crash_end)
-    pd.DataFrame([{'model':'TCP','cov':cov_tcp,'width':w_tcp,'n':n_tcp},
-                  {'model':'TCP-RM','cov':cov_tcrm,'width':w_tcrm,'n':n_trm},
-                  {'model':'QR(rolling)','cov':cov_qr,'width':w_qr,'n':n_qr},
-                  {'model':'GARCH','cov':cov_ga,'width':w_ga,'n':n_ga},
-                  {'model':'Hist','cov':cov_hi,'width':w_hi,'n':n_hi}]).to_csv(
-        f'figures/covid_window_metrics_{series_name}.csv', index=False, float_format='%.4f')
+    # Save COVID-window metrics to CSV (now includes ACI)
+    rows = []
+    for key, iv in [('TCP', iv_tcp), ('TCP-RM', iv_tcrm), ('QR(rolling)', iv_qr),
+                    ('GARCH', iv_garch), ('Hist', iv_hist), ('ACI', iv_aci)]:
+        cov, w, n = window_metrics(returns_series, iv, crash_start, crash_end)
+        rows.append({'model': key, 'cov': cov, 'width': w, 'n': n})
+    pd.DataFrame(rows).to_csv(f'figures/covid_window_metrics_{series_name}.csv',
+                              index=False, float_format='%.4f')
 
 if __name__ == '__main__':
     ensure_dirs()
