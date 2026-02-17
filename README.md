@@ -6,7 +6,7 @@
 [![Dataset](https://img.shields.io/badge/Data-Financial%20Returns-yellowgreen)]()
 
 **Temporal Conformal Prediction (TCP)** is a novel framework for constructing adaptive, distribution-free prediction intervals in financial time series. 
-The methodology and its benchmarking against GARCH, Quantile Regression, and Historical Simulation across S&P 500, Bitcoin, and Gold are thoroughly 
+The methodology and its benchmarking against ACI, GARCH, Quantile Regression, and Historical Simulation across S&P 500, Bitcoin, and Gold are thoroughly 
 detailed in our accompanying research paper.
 🔍 This repository contains both the dataset and the complete implementation codes to support full reproducibility.
 
