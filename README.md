@@ -34,6 +34,7 @@ Risk Forecasting. [Manuscript under review]
 ## 📊 Citation
 If you use this code or method in your own work, please cite:
 
+```bibtex
 @article{Aich2025TCP,
   title   = {Temporal Conformal Prediction (TCP): A Distribution-Free Statistical and Machine Learning Framework for Adaptive Risk Forecasting},
   author  = {Aich, Agnideep, Aich, Ashit Baran and Jain, Dipak},
@@ -41,7 +42,7 @@ If you use this code or method in your own work, please cite:
   note    = {Manuscript under review}
   url     = {https://doi.org/10.48550/arXiv.2507.05470 }
 }
-
+```
 ## 📬 Contact
 For questions or collaborations, feel free to contact:
 
