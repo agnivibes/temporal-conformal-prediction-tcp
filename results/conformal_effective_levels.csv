@@ -1,0 +1,4 @@
+requested_tau,order_statistic_k,cal_size,attainable,effective_guaranteed_miscoverage,attainable_floor_1_over_m_plus_1
+0.01,61,60,False,,0.01639344262295082
+0.025,60,60,True,0.016393442622950838,0.01639344262295082
+0.05,58,60,True,0.049180327868852514,0.01639344262295082
